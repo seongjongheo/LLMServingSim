@@ -6,6 +6,7 @@ import yaml
 from .memory_model import calculate_sizes
 from .gate_function import GateRouter
 from .config_builder import get_device
+from .utils import LOCAL_ATTENTION, resolve_layer_types
 from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
@@ -110,6 +111,8 @@ class TraceCtx:
     ep_total: int      # total EP degree across DP group
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
+    layer_is_local: tuple  # per transformer block: does it only read a sliding window?
+    sliding_window: int    # tokens a local layer may look back over, 0 when none
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
 
 
@@ -127,6 +130,16 @@ class BatchCtx:
     lm_head_len: int    # number of sequences
     decode_lens: list   # per-PIM-channel decode lengths (None if no PIM)
     channel_split: int  # PIM channel split factor
+    # The same four keys as a local layer sees them: every per-request kv length
+    # clamped to the sliding window. A local layer reads only that much, and
+    # profiled decode attention is a straight line in (n_decode * kv_decode)
+    # -- R^2 = 1.0000 -- so charging it for the whole sequence overstates its
+    # time by the ratio of the two, 32x at 32k tokens with a 1k window. Equal to
+    # the uncapped fields when no layer is local.
+    kv_prefill_local: int
+    kv_decode_mean_local: int
+    kv_decode_max_local: int
+    kv_decode_min_local: int
 
 
 @dataclass
@@ -898,7 +911,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                     sliding_window=None, sliding_window_pattern=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -921,6 +935,10 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pim_config = pim_model.get_config()
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
+    layer_types, window = resolve_layer_types(config, sliding_window,
+                                              sliding_window_pattern)
+    layer_is_local = tuple(t == LOCAL_ATTENTION for t in layer_types)
+
     return TraceCtx(
         hardware=hardware, model=model, config=config, perf_db=perf_db,
         node_id=node_id,
@@ -932,6 +950,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        layer_is_local=layer_is_local, sliding_window=(window or 0),
     )
 
 
@@ -970,9 +989,29 @@ def _build_batch_ctx(batch, ctx):
         kv_decode_min = 0
         total_len = max(1, total_len)  # preserve for size calcs
 
+    window = ctx.sliding_window
+    if window and any(ctx.layer_is_local):
+        # Clamp per request, then re-aggregate: kv_prefill is a sum over prefill
+        # requests, so clamping the sum would be wrong whenever more than one of
+        # them is longer than the window.
+        kv_prefill_local = sum(min(k, window) for k in batch.prefill_k_list)
+        local_decode = [min(k, window) for k in batch.decode_k_list]
+        if ctx.enable_attn_offloading and ctx.pim_model is not None:
+            local_decode = []
+        kv_decode_mean_local = (sum(local_decode) // len(local_decode)) if local_decode else 0
+        kv_decode_max_local = max(local_decode) if local_decode else 0
+        kv_decode_min_local = min(local_decode) if local_decode else 0
+    else:
+        kv_prefill_local = kv_prefill
+        kv_decode_mean_local = kv_decode_mean
+        kv_decode_max_local = kv_decode_max
+        kv_decode_min_local = kv_decode_min
+
     return BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
                     kv_decode_mean, kv_decode_max, kv_decode_min,
-                    lm_head_len, decode_lens, channel_split)
+                    lm_head_len, decode_lens, channel_split,
+                    kv_prefill_local, kv_decode_mean_local,
+                    kv_decode_max_local, kv_decode_min_local)
 
 
 # ======================================================================
@@ -990,6 +1029,27 @@ def _layer_category(perf_db, layer_name):
     return None
 
 
+def _is_local_layer(ctx, layer_num):
+    """Is transformer block ``layer_num`` a sliding-window attention layer?
+
+    ``layer_num`` is None for the prologue and head layers, which carry no
+    attention, so they are never local.
+    """
+    if layer_num is None or not ctx.sliding_window:
+        return False
+    return 0 <= layer_num < len(ctx.layer_is_local) and ctx.layer_is_local[layer_num]
+
+
+def _attn_kv_keys(bctx, is_local):
+    """``(kv_prefill, kv_decode_mean, kv_decode_max, kv_decode_min)`` as this
+    layer sees them -- clamped to the sliding window for a local layer."""
+    if is_local:
+        return (bctx.kv_prefill_local, bctx.kv_decode_mean_local,
+                bctx.kv_decode_max_local, bctx.kv_decode_min_local)
+    return (bctx.kv_prefill, bctx.kv_decode_mean,
+            bctx.kv_decode_max, bctx.kv_decode_min)
+
+
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
                 comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL'):
     """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
@@ -1001,21 +1061,26 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             f"profiler/models/<model_type>.yaml or remove it from the sequence."
         )
 
+    is_local = _is_local_layer(ctx, layer_num)
+
     if category == "per_sequence":
         latency_ns = _lookup_per_sequence(ctx.perf_db, layer_name, ctx.tp_size, bctx.lm_head_len)
     elif category == "attention":
+        kv_prefill, kv_mean, kv_max, kv_min = _attn_kv_keys(bctx, is_local)
         latency_ns = _lookup_attention_with_skew(
             ctx.perf_db, ctx.tp_size,
-            bctx.prefill_chunk, bctx.kv_prefill,
-            bctx.n_decode, bctx.kv_decode_mean, bctx.kv_decode_max,
-            bctx.kv_decode_min,
+            bctx.prefill_chunk, kv_prefill,
+            bctx.n_decode, kv_mean, kv_max, kv_min,
         )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
     # Size calculation uses the same canonical layer names.
     if layer_name == 'attention':
-        kv_len_for_sizes = bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
+        # The kernel reads only what it attends to, so the tensor it loads is
+        # capped for a local layer exactly as its latency is.
+        kv_prefill_sz, kv_mean_sz, _, _ = _attn_kv_keys(bctx, is_local)
+        kv_len_for_sizes = kv_prefill_sz + bctx.n_decode * kv_mean_sz
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
                                        kv_len=kv_len_for_sizes,
                                        parallel=ctx.tp_size, fp=ctx.fp)
@@ -1399,13 +1464,16 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                      sliding_window=None, sliding_window_pattern=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           sliding_window=sliding_window,
+                           sliding_window_pattern=sliding_window_pattern)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1424,7 +1492,11 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
     # Transformer blocks
     num_layers = config['num_hidden_layers']
-    iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+    # Block copy builds one transformer block and repeats it. That holds only
+    # while every block is identical -- a hybrid model's local and full layers
+    # read different amounts of KV, so each has to be emitted on its own.
+    per_layer = block_mode_on or any(ctx.layer_is_local)
+    iter_count, copy_count = (num_layers, 1) if per_layer else (1, num_layers)
 
     for layer_num in range(iter_count):
         block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
@@ -1433,7 +1505,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         # opts into block copy (BALANCED is deterministic; others
         # carry tiny per-layer variance that block_copy swallows
         # for the sake of trace-generation speed).
-        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not per_layer
         if can_copy:
             for _ in range(copy_count):
                 block_starts.append(written)
@@ -1462,13 +1534,16 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                                  sliding_window=None, sliding_window_pattern=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           sliding_window=sliding_window,
+                           sliding_window_pattern=sliding_window_pattern)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1505,7 +1580,9 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
     # MIDDLE LAYERS: interleaved post_attn + pre_attn
     middle_layers = num_layers - 1
-    iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+    # See _synthesize_trace: a hybrid model's blocks are not interchangeable.
+    per_layer = block_mode_on or any(ctx.layer_is_local)
+    iter_count, copy_count = (middle_layers, 1) if per_layer else (1, middle_layers)
 
     for layer_num in range(iter_count):
         block_lines = []
@@ -1523,7 +1600,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
         # opts into block copy (BALANCED is deterministic; others
         # carry tiny per-layer variance that block_copy swallows
         # for the sake of trace-generation speed).
-        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not per_layer
         if can_copy:
             for _ in range(copy_count):
                 rows.extend(block_lines)
@@ -1608,7 +1685,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   sliding_window=None, sliding_window_pattern=None):
 
     model = batch.model
     config = get_config(model)
@@ -1658,7 +1736,9 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                        sliding_window=sliding_window,
+                        sliding_window_pattern=sliding_window_pattern)
     if not enable_sub_batch_interleaving:
         rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)
     else:
