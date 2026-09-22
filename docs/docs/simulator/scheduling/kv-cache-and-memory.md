@@ -88,7 +88,7 @@ Per-request KV cache, tracked at block granularity. The block size
 is `--block-size` tokens (default 16):
 
 ```
-bytes_per_block = (
+bytes_per_logical_block = (
     2                                         # K and V
     * num_layers
     * num_key_value_heads
@@ -103,6 +103,22 @@ alone (`MemoryModel.get_kv()`). Both factors belong there: KV per layer
 shards across TP ranks, and the layers themselves are split across PP
 stages, so a rank in a `tp=2 x pp=2` instance holds a quarter of the
 model's KV, not a half.
+
+For `pp_size == 1`, the manager represents each token range as a
+`LogicalKVBlock`. Accessing `block[layer_id].hbm_block` returns that layer's
+storage allocation from the shared NPU pool. One storage block occupies
+`MemoryModel.get_layer_kv(block_size)` bytes: the formula above without the
+layer count, divided by TP only. Allocating a logical block reserves one
+storage block for every layer, after checking capacity for all of them.
+Prefix-cache keys include the layer id, and a prefix is reused only if every
+layer is resident. These are metadata objects, not actual KV tensors.
+
+The pool retains the previous capacity in complete logical blocks; dividing
+the reported storage-block count by the layer count gives the logical-block
+count. The split currently assumes equal KV shapes across layers. PP uses
+the existing aggregate per-rank allocation and logs a warning. CPU/CXL copies
+still contain all layers, and neither HBF transfers nor layer-specific
+attention windows are implemented by this change.
 
 Note also that `head_dim` is read explicitly from the model config, not
 derived — see **[Model config](/docs/reference/model-config)**. On Qwen3
@@ -120,7 +136,7 @@ How many blocks exist is fixed at startup, the way vLLM sizes its cache:
 ```
 requested   = npu_mem.mem_size * npu_mem.mem_util      # per rank
 kv_bytes    = requested - model weight
-num_blocks  = kv_bytes / bytes_per_block
+num_logical_blocks = floor(kv_bytes / bytes_per_logical_block)
 ```
 
 `npu_mem.mem_util` defaults to `--npu-memory-utilization` (`0.9`), the
@@ -131,7 +147,7 @@ run prints the resulting figure per instance under **KV Cache
 Initialization** at startup:
 
 ```
-  • Instance [0] : 585248 tokens / 36578 blocks (71.44 GiB/rank at util 0.90)
+  • Instance [0] : 585248 tokens / 1170496 storage blocks (71.44 GiB/rank at util 0.90)
 ```
 
 :::caution[Calibrate `mem_util` when the KV cache is the binding constraint]

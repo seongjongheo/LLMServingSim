@@ -1,0 +1,28 @@
+{
+  "architectures": [
+    "Gemma3ForConditionalGeneration"
+  ],
+  "model_type": "gemma3",
+  "text_model_type": "gemma3_text",
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_size": 5376,
+  "intermediate_size": 21504,
+  "max_position_embeddings": 131072,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 62,
+  "num_key_value_heads": 16,
+  "head_dim": 128,
+  "query_pre_attn_scalar": 168,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "rope_local_base_freq": 10000.0,
+  "rope_scaling": {
+    "factor": 8.0,
+    "rope_type": "linear"
+  },
+  "sliding_window": 1024,
+  "sliding_window_pattern": 6,
+  "torch_dtype": "bfloat16",
+  "vocab_size": 262208,
+  "tie_word_embeddings": true
+}

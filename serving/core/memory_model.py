@@ -1,6 +1,7 @@
 import os
-from .utils import get_config
+from .utils import get_config, resolve_layer_types
 from .block_pool import Device, BlockPool, PrefixCacheStats
+from .utils import LOCAL_ATTENTION
 from .kv_cache_manager import TieredKVCacheManager, request_block_hashes
 from .logger import get_logger
 
@@ -26,7 +27,8 @@ class MemoryModel():
     an allocation that cannot be satisfied says so in the call that asks.
     """
 
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0,
+                 sliding_window=None, sliding_window_pattern=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -71,7 +73,18 @@ class MemoryModel():
         self._cpu_reserved = 0
 
         self._bytes_per_token = self.get_kv(1)              # per rank
-        self._npu_bytes_per_block = self._bytes_per_token * block_size
+        # Keep the logical token-block capacity unchanged while splitting HBM
+        # storage into layer slots. PP retains its aggregate rank model until
+        # per-stage layer ownership is represented explicitly.
+        self.kv_num_layers = self.n_layer if self.pp_size == 1 else 1
+        self._logical_bytes_per_block = self._bytes_per_token * block_size
+        self._layer_bytes_per_block = self.get_layer_kv(block_size)
+        self._npu_bytes_per_block = (self._layer_bytes_per_block
+                                    if self.pp_size == 1
+                                    else self._logical_bytes_per_block)
+        if self.pp_size > 1:
+            self.logger.warning("Layer KV splitting is disabled for PP > 1; "
+                                "using aggregate per-rank KV blocks")
         self._cluster_bytes_per_token = self._bytes_per_token * self.num_npus
 
         # vLLM: requested = total_gpu_memory * gpu_memory_utilization, then
@@ -80,7 +93,7 @@ class MemoryModel():
         # this capacity is an upper bound on vLLM's at the same utilization).
         requested = int(self.npu_mem * self.npu_memory_utilization)
         kv_bytes = requested - self.weight
-        if kv_bytes < self._npu_bytes_per_block:
+        if kv_bytes < self._logical_bytes_per_block:
             raise RuntimeError(
                 f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: "
                 f"npu_memory_utilization={self.npu_memory_utilization} leaves "
@@ -89,9 +102,10 @@ class MemoryModel():
                 f"{self.npu_mem / MB_TO_BYTE:.2f}MB, minus "
                 f"{self.weight / MB_TO_BYTE:.2f}MB of weights), which is less "
                 f"than one {block_size}-token block "
-                f"({self._npu_bytes_per_block / MB_TO_BYTE:.2f}MB)"
+                f"({self._logical_bytes_per_block / MB_TO_BYTE:.2f}MB)"
             )
-        npu_blocks = kv_bytes // self._npu_bytes_per_block
+        logical_blocks = kv_bytes // self._logical_bytes_per_block
+        npu_blocks = logical_blocks * self.kv_num_layers
 
         self.npu_pool = BlockPool(
             Device.NPU, int(npu_blocks), block_size, self._npu_bytes_per_block,
@@ -99,9 +113,9 @@ class MemoryModel():
             node_id=node_id, instance_id=instance_id,
         )
         self.logger.info(
-            "NPU: KV cache %d blocks (%d tokens, %.2fMB) at utilization %.2f",
+            "NPU: KV cache %d storage blocks (%d tokens, %.2fMB) at utilization %.2f",
             self.npu_pool.num_blocks,
-            self.npu_pool.num_blocks * block_size,
+            logical_blocks * block_size,
             self.npu_pool.num_blocks * self._npu_bytes_per_block / MB_TO_BYTE,
             self.npu_memory_utilization,
         )
@@ -116,9 +130,28 @@ class MemoryModel():
             self.storage_pool = self._build_storage_pool(prefix_pool, prefix_storage)
             self.lower_pools.append(self.storage_pool)
 
+        # Hybrid attention: which layers only read a sliding window, and how
+        # wide it is. Resolved from the model config, or imposed by the CLI so
+        # an already-profiled model can stand in for a hybrid one. Only with the
+        # per-layer split (pp_size == 1) is there anything to key it on.
+        self.layer_types, self.sliding_window = (
+            resolve_layer_types(self.config, sliding_window, sliding_window_pattern)
+            if self.kv_num_layers == self.n_layer
+            else ([], None)
+        )
+        if self.sliding_window:
+            num_local = sum(1 for t in self.layer_types if t == LOCAL_ATTENTION)
+            self.logger.info(
+                "NPU: hybrid attention, %d of %d layers local with a %d-token window",
+                num_local, self.n_layer, self.sliding_window,
+            )
+
         self.kv = TieredKVCacheManager(
             block_size, self.npu_pool, self.lower_pools,
             enable_caching=enable_prefix_caching,
+            num_layers=self.kv_num_layers,
+            layer_types=self.layer_types if self.sliding_window else None,
+            sliding_window=self.sliding_window,
         )
 
     def _build_storage_pool(self, prefix_pool, prefix_storage):
@@ -213,6 +246,13 @@ class MemoryModel():
 
         # K & V multiply 2
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
+
+    def get_layer_kv(self, seq):
+        """KV bytes for one layer on a TP rank, assuming evenly sharded KV."""
+        return 2 * self.kv_dim * seq * self.kv_fp // self.tp_size
+    # KV capacity for one layer.
+    ###############################################################
+
 
     def get_total_kv(self, req):
         """Bytes of KV a request's whole computed context occupies, per rank.

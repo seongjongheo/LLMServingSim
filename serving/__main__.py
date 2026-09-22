@@ -273,6 +273,18 @@ def main():
                         'Limits how many tokens a single prefill request consumes per iteration, '
                         'preventing long prompts from monopolizing the token budget. '
                         'When 0, a single prefill can consume the entire budget')
+    parser.add_argument('--sliding-window', type=int, default=None,
+                        help='sliding-window size in tokens for local attention layers, overriding '
+                        'the model config. A local layer only ever reads the last N tokens, so its '
+                        'KV past that point is dropped and its footprint stops growing with the '
+                        'sequence. Combined with --sliding-window-pattern this imposes a hybrid '
+                        'attention layout on any model, which is how an already-profiled model '
+                        'stands in for a hybrid one whose own profile does not exist yet')
+    parser.add_argument('--sliding-window-pattern', type=int, default=None,
+                        help='one layer in every N is full attention and the rest are local, '
+                        'following HF\'s rule that layer i is global when (i + 1) %% N == 0 '
+                        '(Gemma-3 ships 6, i.e. 5 local per global). Requires --sliding-window. '
+                        'Omit it and every layer is local, as a uniform sliding-window model means')
     parser.add_argument('--dtype', type=str, choices=['float16', 'bfloat16', 'float32', 'fp8', 'int8'], default=None,
                         help='model weight data type (vLLM-style). When omitted, defaults to the model config\'s '
                         '``torch_dtype`` (falling back to bfloat16). Overrides only take effect if the profiler '
@@ -540,6 +552,8 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
+            sliding_window=args.sliding_window,
+            sliding_window_pattern=args.sliding_window_pattern,
         ))
 
     # The derived KV capacity, not the utilization fraction, is what decides
@@ -555,7 +569,8 @@ def main():
         label = f"Instance \\[{inst_id}]"
         print_markup(
             f"  \u2022 [cyan]{label:<{pad + 1}}[/cyan] : "
-            f"{pool.num_blocks * pool.block_size} tokens / {pool.num_blocks} blocks "
+            f"{pool.num_blocks // sched.kv.num_layers * pool.block_size} tokens / "
+            f"{pool.num_blocks} storage blocks "
             f"({pool.num_blocks * pool.bytes_per_block / GB_TO_BYTE:.2f} GiB/rank "
             f"at util {sched.memory.npu_memory_utilization:.2f})"
         )

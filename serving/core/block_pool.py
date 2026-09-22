@@ -217,8 +217,10 @@ class BlockPool:
             ``requested_memory - non_kv_cache_memory``.
         block_size: tokens per block. The NPU uses ``--block-size``; a lower
             tier uses a multiple of it.
-        bytes_per_block: KV bytes one block occupies *on this tier*. Per-rank
-            for the NPU, full-cluster for CPU/CXL.
+        bytes_per_block: KV bytes one storage block occupies *on this tier*.
+            Per-layer, per-rank for a layer-split NPU pool; full-cluster and
+            all-layer for CPU/CXL. The pool treats cache keys as opaque, so
+            the manager can namespace NPU prefix hashes by layer id.
         enable_caching: when false, blocks are allocated and freed through the
             same free list but never hashed or indexed -- exactly what
             ``--no-enable-prefix-caching`` means in vLLM.
