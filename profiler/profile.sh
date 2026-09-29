@@ -24,6 +24,29 @@ set -euo pipefail
 # The profiler reads model_type from that config to pick an
 # architecture yaml under profiler/models/.
 # MODEL="meta-llama/Llama-3.1-8B"
+# ---------------------------------------------------------------------------
+# A hybrid-attention model (Gemma-3) needs TWO runs, because its layers are not
+# interchangeable: five local layers per global one, and a local layer reads at
+# most `sliding_window` tokens of KV. The profiler builds the model with
+# num_hidden_layers=1, so one run measures one kind. ATTENTION_LAYER_TYPE forces
+# which kind that layer is; the rows carry it, so the second run merges into the
+# same attention.csv rather than overwriting the first.
+#
+#     MODEL="google/gemma-3-27b-it"
+#     HARDWARE="<the GPU actually in the machine>"
+#     TP_DEGREES="1"
+#
+#     ATTENTION_LAYER_TYPE=full  ./profiler/profile.sh
+#     ATTENTION_LAYER_TYPE=local ./profiler/profile.sh
+#
+# Then compare the two at the same key: if they agree, one table would have
+# been enough and the simulator's window clamp was sound; if local is slower,
+# the split was necessary. Either way it is now measured rather than assumed.
+#
+# HARDWARE only names the output folder -- whatever GPU is in the machine is
+# what gets measured, so a mismatch silently files one card's numbers under
+# another's.
+# ---------------------------------------------------------------------------
 MODEL="Qwen/Qwen3-32B"
 
 # GPU identifier used as an output folder name under ``perf/``.
