@@ -158,6 +158,18 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     if args.hf_overrides:
         hf_overrides = _deep_merge(hf_overrides, args.hf_overrides)
 
+    # 3b. Hybrid attention: force the single profiled layer to the kind this
+    # run is measuring. vLLM decides per layer from ``layer_types[layer_idx]``
+    # (v0.19.0 gemma3.py), and with num_hidden_layers=1 only index 0 is ever
+    # read -- which for Gemma-3 is a *local* layer, so a stock run would never
+    # measure the global kernel. Left alone for a model that declares no
+    # layer_types: it has only full attention to measure.
+    if args.model_config and args.model_config.get("layer_types"):
+        hf_overrides["layer_types"] = [
+            "sliding_attention" if args.attention_layer_type == "local"
+            else "full_attention"
+        ]
+
     # 4. TP sharding uses the model config directly. The written
     # config.json will have SHARD_FIELDS divided by tp via hf_overrides,
     # so vLLM's ColumnParallelLinear / RowParallelLinear see the

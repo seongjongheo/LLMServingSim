@@ -111,6 +111,14 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
                         "``--max-num-seqs``. Default: 256.")
 
     # Attention grid.
+    p.add_argument("--attention-layer-type", choices=["full", "local"],
+                   default="full", dest="attention_layer_type",
+                   help="Which attention to measure on a hybrid model whose "
+                        "layers mix the two (Gemma-3). The profiled layer is "
+                        "forced to this kind and the rows are tagged with it, "
+                        "so profiling once per kind fills one CSV with both. "
+                        "No effect on a model without layer_types. "
+                        "Default: full.")
     p.add_argument("--attention-max-kv", type=int, default=16384,
                    help="Cap for the kv_prefill / kv_decode axes. The "
                         "grid grows geometrically from 512 up to "
@@ -321,6 +329,7 @@ def _build_profile_args(
         kv_cache_dtype=ns.kv_cache_dtype,
         max_num_batched_tokens=ns.max_num_batched_tokens,
         max_num_seqs=ns.max_num_seqs,
+        attention_layer_type=ns.attention_layer_type,
         attention_max_kv=ns.attention_max_kv,
         attention_chunk_factor=ns.attention_chunk_factor,
         attention_kv_factor=ns.attention_kv_factor,

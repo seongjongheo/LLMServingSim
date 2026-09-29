@@ -6,7 +6,7 @@ import yaml
 from .memory_model import calculate_sizes
 from .gate_function import GateRouter
 from .config_builder import get_device
-from .utils import LOCAL_ATTENTION, resolve_layer_types
+from .utils import FULL_ATTENTION, LOCAL_ATTENTION, resolve_layer_types
 from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
@@ -502,6 +502,19 @@ def _build_tp_tables(tp_dir):
     attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
     if attn_df is not None:
         tables["attention"] = _build_attention_table(attn_df)
+        # A hybrid model is profiled once per attention kind, and the rows
+        # carry which one they are. Split them into their own tables so a
+        # local layer is looked up against local measurements rather than
+        # against a global kernel evaluated at a shorter kv -- the assumption
+        # the window cap has been standing in for. A CSV without the column
+        # (every bundle written before hybrid support) is all full attention,
+        # and the split is then a no-op.
+        if "attn_type" in attn_df.columns:
+            by_type = {}
+            for name, group in attn_df.groupby("attn_type"):
+                by_type[str(name)] = _build_attention_table(group)
+            if set(by_type) != {FULL_ATTENTION}:
+                tables["attention_by_type"] = by_type
 
     moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
     if moe_df is not None:
@@ -793,6 +806,7 @@ def _skew_alpha(
 def _lookup_attention_with_skew(
     perf_db, tp, prefill_chunk, kv_prefill,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
+    attn_type=FULL_ATTENTION,
 ):
     """Attention lookup with skew correction applied.
 
@@ -811,6 +825,7 @@ def _lookup_attention_with_skew(
     """
     t_mean = _lookup_attention(
         perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_mean,
+        attn_type,
     )
     # No skew → no correction (also saves a redundant lookup).
     if n_decode <= 1 or kv_decode_max == kv_decode_mean:
@@ -828,6 +843,7 @@ def _lookup_attention_with_skew(
         return max(1, int(round(t_mean)))
     t_max = _lookup_attention(
         perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode_max,
+        attn_type,
     )
     # Guard against interpolation producing t_max < t_mean (can happen
     # at the axis boundary); in that case the formula would produce a
@@ -837,13 +853,31 @@ def _lookup_attention_with_skew(
     return max(1, int(round(t_mean + alpha * (t_max - t_mean))))
 
 
-def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode):
+def _attention_table(perf_db, tp, attn_type):
+    """The 4D table to look this layer's attention up in.
+
+    A profile that measured both kinds gets one table per kind; anything
+    else (every bundle predating hybrid support) has a single table, and a
+    local layer falls back to it with its kv already clamped to the window.
+    """
+    tables = _tp_tables(perf_db, tp)
+    by_type = tables.get("attention_by_type")
+    if by_type and attn_type in by_type:
+        return by_type[attn_type]
+    return tables.get("attention")
+
+
+def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decode,
+                      attn_type=FULL_ATTENTION):
     """4D log-linear interpolation on (prefill_chunk, kv_prefill,
     n_decode, kv_decode). Every axis is doubled by the profiler, so we
     bracket each axis's two nearest profiled values and blend linearly
     in log-space.
+
+    ``attn_type`` selects the measurements to interpolate over when the
+    profile measured local and global attention separately.
     """
-    tbl = _tp_tables(perf_db, tp).get("attention")
+    tbl = _attention_table(perf_db, tp, attn_type)
     if tbl is None or not tbl["pc_nd_pairs"]:
         raise KeyError(f"Missing attention profile for tp={tp}.")
 
@@ -1071,6 +1105,7 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
             ctx.perf_db, ctx.tp_size,
             bctx.prefill_chunk, kv_prefill,
             bctx.n_decode, kv_mean, kv_max, kv_min,
+            LOCAL_ATTENTION if is_local else FULL_ATTENTION,
         )
     else:  # dense
         latency_ns = _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)

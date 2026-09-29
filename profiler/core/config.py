@@ -378,6 +378,21 @@ class ProfileArgs:
     profiling is one file-edit away."""
 
     # Attention grid
+    attention_layer_type: str = "full"
+    """Which attention the profiled layer should be: "full" or "local".
+
+    A hybrid model (Gemma-3) mixes both, but the profiler reduces the model
+    to ``num_hidden_layers=1``, so one run sees exactly one of them -- and
+    which one is decided by ``layer_types[0]``, not by anything in the
+    catalog. Both kinds instantiate the same ``Attention`` class, so the
+    difference is the kernel's shape, not its name: a local layer never
+    reads past ``sliding_window`` tokens of KV. Profile once per kind; the
+    writer keys on the type, so the second run merges into the same CSV
+    rather than overwriting the first.
+
+    Ignored by a model that has no ``layer_types``, which is every
+    non-hybrid one -- there is only full attention to measure."""
+
     attention_max_kv: int = 16384
     attention_chunk_factor: float = 2.0
     """Geometric factor for the prefill_chunk axis. Default 2.0

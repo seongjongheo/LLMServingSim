@@ -24,6 +24,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Iterator
 
+# Attention kinds a hybrid model mixes. Spelled the same way the simulator
+# spells them (serving/core/utils.py) so the CSV reads the same on both sides.
+FULL_ATTENTION = "full"
+LOCAL_ATTENTION = "local"
+
 from profiler.core.config import Architecture, LayerEntry, ProfileArgs
 from profiler.core.engine import RuntimeLimits
 from profiler.core.hooks.batch import Shot
@@ -57,6 +62,13 @@ class AttentionPoint:
     n_decode: int
     kv_decode: int
     microseconds: float
+    # Which attention a hybrid model's layer is. A local layer reads at
+    # most ``sliding_window`` tokens of KV no matter how long the sequence
+    # is, so it is a different kernel shape at the same (n_decode,
+    # kv_decode) key and cannot share a row with a global one. Defaults to
+    # "full", which is what every non-hybrid model is and what every CSV
+    # written before this column existed holds.
+    attn_type: str = FULL_ATTENTION
 
 
 @dataclass(frozen=True)
@@ -308,6 +320,13 @@ class AttentionCategory(Category):
     sink_filename = "attention.csv"
     label = "attention"
 
+    def __init__(self, attn_type: str = FULL_ATTENTION):
+        # Which attention this run is measuring. A hybrid model mixes local
+        # and global layers that share the ``Attention`` class, so the engine
+        # -- not the catalog -- decides which one the profiled layer is, and
+        # the rows have to be tagged accordingly.
+        self.attn_type = attn_type
+
     def compose_shots(self, arch, args, limits, tp):
         # Axes are generated from the live runtime limits so the grid
         # naturally scales with each model's max_num_batched_tokens /
@@ -439,6 +458,7 @@ class AttentionCategory(Category):
             n_decode=n_decode,
             kv_decode=kv_decode,
             microseconds=total_us,
+            attn_type=self.attn_type,
         )
 
     def catalog_slice(self, arch):
@@ -530,7 +550,8 @@ class ExpertCategory(Category):
 # Category registry
 # ---------------------------------------------------------------------------
 
-def categories_for(arch: Architecture, tp: int) -> list[Category]:
+def categories_for(arch: Architecture, tp: int,
+                   attn_type: str = FULL_ATTENTION) -> list[Category]:
     """Return the list of categories that should run for this (arch, tp).
 
     Excludes:
@@ -545,7 +566,7 @@ def categories_for(arch: Architecture, tp: int) -> list[Category]:
     registry = [
         (DenseCategory(), arch.catalog.dense),
         (SequenceCategory(), arch.catalog.per_sequence),
-        (AttentionCategory(), arch.catalog.attention),
+        (AttentionCategory(attn_type), arch.catalog.attention),
         (ExpertCategory(), arch.catalog.moe),
     ]
     for cat, entries in registry:

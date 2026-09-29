@@ -243,7 +243,11 @@ def sink_for(category: Category, out_dir: Path) -> DedupSink:
 _KEY_FIELDS_BY_CATEGORY: dict[str, list[str]] = {
     "dense": ["layer", "tokens"],
     "per_sequence": ["layer", "sequences"],
-    "attention": ["prefill_chunk", "kv_prefill", "n_decode", "kv_decode"],
+    # attn_type is a key, not a value: a local and a global measurement of the
+    # same shape are two different kernels, and one must not overwrite the other
+    # when a second run is merged into an existing CSV.
+    "attention": ["prefill_chunk", "kv_prefill", "n_decode", "kv_decode",
+                  "attn_type"],
     "moe": ["tokens", "activated_experts"],
 }
 

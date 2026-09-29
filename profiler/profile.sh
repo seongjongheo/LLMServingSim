@@ -51,6 +51,10 @@ MAX_NUM_SEQS=256                 # vLLM's --max-num-seqs
 # --- Attention grid ---------------------------------------------------------
 # Upper bound for kv_prefill / kv_decode axes. The grid grows
 # geometrically from 512 up to min(this, max_model_len).
+# Hybrid attention (Gemma-3): which kind the profiled layer should be.
+# Leave unset for a model whose layers are all full attention. For a hybrid
+# one, run twice -- "full" then "local" -- and both land in the same CSV.
+# ATTENTION_LAYER_TYPE=full
 ATTENTION_MAX_KV=16384
 # Geometric factor for the prefill_chunk axis (grows from 16 up to
 # MAX_NUM_BATCHED_TOKENS). 2.0 is doubling; lower for denser sampling
@@ -119,6 +123,7 @@ cmd=(python3 -m profiler profile "$MODEL" --hardware "$HARDWARE")
 [[ -n "${KV_CACHE_DTYPE:-}" ]]         && cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]] && cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 [[ -n "${MAX_NUM_SEQS:-}" ]]           && cmd+=(--max-num-seqs "$MAX_NUM_SEQS")
+[[ -n "${ATTENTION_LAYER_TYPE:-}" ]]   && cmd+=(--attention-layer-type "$ATTENTION_LAYER_TYPE")
 [[ -n "${ATTENTION_MAX_KV:-}" ]]       && cmd+=(--attention-max-kv "$ATTENTION_MAX_KV")
 [[ -n "${ATTENTION_CHUNK_FACTOR:-}" ]] && cmd+=(--attention-chunk-factor "$ATTENTION_CHUNK_FACTOR")
 [[ -n "${ATTENTION_KV_FACTOR:-}" ]]    && cmd+=(--attention-kv-factor "$ATTENTION_KV_FACTOR")

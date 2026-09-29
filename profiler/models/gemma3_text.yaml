@@ -1,0 +1,96 @@
+# Gemma-3 text decoder — class catalog.
+#
+# Covers the text tower of every Gemma-3 checkpoint (1B / 4B / 12B / 27B).
+# The released checkpoints are multimodal (`Gemma3ForConditionalGeneration`,
+# `model_type: gemma3`, with the decoder nested under `text_config`); this
+# catalog is for the text-only pair, `Gemma3ForCausalLM` + `gemma3_text`, which
+# is what `configs/model/google/*.json` declares. Serving is text-only here, so
+# booting the SigLIP tower would cost memory and profile time for layers that
+# never run.
+#
+# Two things set Gemma-3 apart from Llama:
+#
+# * **Hybrid attention.** `sliding_window_pattern` layers form a group in which
+#   the last one is global and the rest are local, i.e. 5 local per global at
+#   the shipped pattern of 6. Both kinds instantiate the same `Attention` class,
+#   so a single catalog entry covers them and the *shape* is what differs --
+#   a local layer never sees more than `sliding_window` tokens of KV.
+#   `profiler/core/config.py` reduces the model to `num_hidden_layers=1` for
+#   profiling, and layer 0 of Gemma-3 is a **local** layer, so a stock profile
+#   run measures the local kernel only. Measuring the global one needs the
+#   window turned off for that run.
+#
+# * **Four norms per block, not two.** Gemma-3 sandwiches both the attention and
+#   the MLP: `input_layernorm` / `post_attention_layernorm` around attention,
+#   `pre_feedforward_layernorm` / `post_feedforward_layernorm` around the MLP.
+#   The simulator's sequence emits `layernorm` twice per block (once before
+#   attention, once after `o_proj`), so each emission stands for one of those
+#   pairs. They are the same shape and the same cost, which is why one catalog
+#   entry serves both.
+#
+# Gemma-3 also normalises Q and K per head before rotary, the same shape as
+# Qwen3's, merged here into one `qk_norm` entry.
+#
+# Canonical layer names mirror vLLM's attribute names (see
+# vllm/model_executor/models/gemma3.py, read at tag v0.19.0). Two of them are
+# Gemma-specific rather than the shared implementations Llama uses: every norm
+# is `GemmaRMSNorm`, not `RMSNorm`, and the activation is `GeluAndMul`, not
+# `SiluAndMul`.
+
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, qk_norm, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   []
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: GemmaRMSNorm
+      within: Gemma3DecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    qk_norm:
+      vllm: GemmaRMSNorm
+      within: Gemma3Attention
+      tp_stable: true
+    rotary_emb:
+      # A local layer overrides rope to rope_type="default" on
+      # rope_local_base_freq, which get_rope() answers with RotaryEmbedding. A
+      # global layer keeps the config's {"rope_type": "linear", "factor": 8.0}
+      # and gets LinearScalingRotaryEmbedding instead (gemma3.py:168-186,
+      # rotary_embedding/__init__.py:130,172). A catalog entry binds one class,
+      # and with num_hidden_layers=1 the profiled layer is local, so this is the
+      # class that shows up. Profiling a global layer means swapping this to
+      # LinearScalingRotaryEmbedding for that run.
+      vllm: RotaryEmbedding
+    o_proj:
+      vllm: RowParallelLinear
+      within: Gemma3Attention
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+    act_fn:
+      vllm: GeluAndMul
+    down_proj:
+      vllm: RowParallelLinear
+      within: Gemma3MLP
+    final_layernorm:
+      vllm: GemmaRMSNorm
+      within: Gemma3Model
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
