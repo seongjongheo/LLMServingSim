@@ -82,8 +82,12 @@ catalog:
       vllm: RowParallelLinear
       within: Gemma3MLP
     final_layernorm:
+      # ``within`` is matched against the whole ancestor chain, deepest wins, so
+      # either Gemma3Model or Gemma3ForCausalLM would separate this from the
+      # per-block norms. Named for the ForCausalLM the way llama.yaml and
+      # qwen3.yaml name theirs -- a profile run found no match on Gemma3Model.
       vllm: GemmaRMSNorm
-      within: Gemma3Model
+      within: Gemma3ForCausalLM
       tp_stable: true
   per_sequence:
     lm_head:
