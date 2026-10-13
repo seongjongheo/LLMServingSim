@@ -1,0 +1,17 @@
+layer,sequences,time_us
+lm_head,1,20875.7
+lm_head,2,23421.2
+lm_head,3,27554.4
+lm_head,4,26574.1
+lm_head,5,36352.6
+lm_head,6,34879.6
+lm_head,7,35266.2
+lm_head,8,35188.9
+sampler,1,15.5303
+sampler,2,34.5807
+sampler,3,38.2073
+sampler,4,36.7137
+sampler,5,42.7297
+sampler,6,60.3937
+sampler,7,66.996
+sampler,8,54.7297

@@ -13,7 +13,7 @@
             "instances": [
                 {
                     "model_name": "google/gemma-3-27b-it",
-                    "hardware": "RTXPRO6000",
+                    "hardware": "T4",
                     "npu_mem": {
                         "mem_size": 96,
                         "mem_bw": 1597,

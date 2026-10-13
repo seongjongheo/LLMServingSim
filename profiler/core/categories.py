@@ -474,7 +474,11 @@ class AttentionCategory(Category):
             decodes = reqs
         n_dec = len(decodes)
         kv_dec = decodes[0][1] if decodes else 0
-        return (pc, kp, n_dec, kv_dec)
+        # Must stay aligned with the CSV row key (writer.py's
+        # _KEY_FIELDS_BY_CATEGORY["attention"]), attn_type included: resume
+        # compares the two directly, and a shorter tuple here matches nothing,
+        # so every shot gets re-fired on what should have been a resume.
+        return (pc, kp, n_dec, kv_dec, self.attn_type)
 
 
 # ---------------------------------------------------------------------------
