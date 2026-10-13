@@ -164,11 +164,23 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     # read -- which for Gemma-3 is a *local* layer, so a stock run would never
     # measure the global kernel. Left alone for a model that declares no
     # layer_types: it has only full attention to measure.
+    #
+    # The global run must also drop ``sliding_window`` itself. Setting
+    # layer_types alone leaves the field in the config, and something upstream
+    # of the attention module -- the KV cache spec, by the look of it -- still
+    # reads it and caps the context at the window: a T4 sweep measured decode
+    # attention flat from kv 1024 to 16384 with layer_types forced to
+    # full_attention, while the same model with the field deleted scaled 2.0x
+    # per doubling across 1024 -> 4096, as a KV-bandwidth read should. A
+    # Gemma-3 global layer genuinely has no window, so deleting the field is
+    # what measures it, not a distortion of it.
     if args.model_config and args.model_config.get("layer_types"):
-        hf_overrides["layer_types"] = [
-            "sliding_attention" if args.attention_layer_type == "local"
-            else "full_attention"
-        ]
+        if args.attention_layer_type == "local":
+            hf_overrides["layer_types"] = ["sliding_attention"]
+        else:
+            hf_overrides["layer_types"] = ["full_attention"]
+            hf_overrides["sliding_window"] = None
+            hf_overrides["sliding_window_pattern"] = None
 
     # 4. TP sharding uses the model config directly. The written
     # config.json will have SHARD_FIELDS divided by tp via hf_overrides,
