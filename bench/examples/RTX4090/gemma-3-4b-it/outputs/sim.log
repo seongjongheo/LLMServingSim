@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/LLMServingSim/serving/__main__.py", line 32, in <module>
+    from pyinstrument import Profiler
+ModuleNotFoundError: No module named 'pyinstrument'
