@@ -45,7 +45,8 @@ import pandas as pd
 from profiler.core import logger as log
 from profiler.core.config import Architecture, ProfileArgs
 from profiler.core.hooks.batch import Shot
-from profiler.core.hooks.timings import TimingSample
+from profiler.core.engine import attention_layer_indices
+from profiler.core.hooks.timings import TimingSample, select_attention
 
 
 # ---------------------------------------------------------------------------
@@ -317,26 +318,28 @@ def _build_cases(args: ProfileArgs, limits) -> list[SkewCase]:
 # Measurement
 # ---------------------------------------------------------------------------
 
-def _measure(llm, reqs, slice_, iters: int) -> float:
+def _measure(llm, reqs, slice_, iters: int, keep) -> float:
     shot = Shot(requests=[tuple(r) for r in reqs])
     raw = llm.collective_rpc(
         "fire", args=(shot.as_dict(), slice_, "attention", iters))
-    timings = [TimingSample(layer=d["layer"],
-                            microseconds=float(d["microseconds"]))
-               for d in raw[0]]
-    return sum(t.microseconds for t in timings if t.layer == "attention")
+    timings = select_attention(
+        [TimingSample(layer=d["layer"], microseconds=float(d["microseconds"]))
+         for d in raw[0]], keep)
+    # Per layer: a hybrid block keeps several local layers, all one shape.
+    attn = [t.microseconds for t in timings if t.layer == "attention"]
+    return sum(attn) / len(attn)
 
 
-def _measure_case(llm, case: SkewCase, slice_, iters: int) -> dict:
+def _measure_case(llm, case: SkewCase, slice_, iters: int, keep=None) -> dict:
     base = [(case.pc, case.kp)] if case.pc > 0 else []
     uni_mean_reqs = base + [(1, case.kv_mean)] * case.n
     uni_max_reqs  = base + [(1, case.kv_big)]  * case.n
     skew_reqs     = base + [(1, case.kv_big)] * case.nb + \
                     [(1, case.kvs)] * (case.n - case.nb)
 
-    t_mean = _measure(llm, uni_mean_reqs, slice_, iters)
-    t_max  = _measure(llm, uni_max_reqs,  slice_, iters)
-    t_skew = _measure(llm, skew_reqs,     slice_, iters)
+    t_mean = _measure(llm, uni_mean_reqs, slice_, iters, keep)
+    t_max  = _measure(llm, uni_max_reqs,  slice_, iters, keep)
+    t_skew = _measure(llm, skew_reqs,     slice_, iters, keep)
 
     alpha = ((t_skew - t_mean) / (t_max - t_mean)
              if t_max > t_mean else float("nan"))
@@ -468,7 +471,8 @@ def sample_skew(
     with log.progress(label, total=len(cases)) as bar:
         for i, case in enumerate(cases):
             try:
-                row = _measure_case(llm, case, slice_, iters)
+                row = _measure_case(llm, case, slice_, iters,
+                                    attention_layer_indices(args))
             except Exception as e:
                 log.warning(
                     "skew shot failed (n=%d nb=%d pc=%d kp=%d): %s",

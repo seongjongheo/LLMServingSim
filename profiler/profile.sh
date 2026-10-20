@@ -27,10 +27,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # A hybrid-attention model (Gemma-3) needs TWO runs, because its layers are not
 # interchangeable: five local layers per global one, and a local layer reads at
-# most `sliding_window` tokens of KV. The profiler builds the model with
-# num_hidden_layers=1, so one run measures one kind. ATTENTION_LAYER_TYPE forces
-# which kind that layer is; the rows carry it, so the second run merges into the
-# same attention.csv rather than overwriting the first.
+# most `sliding_window` tokens of KV. The profiler builds one repeat of that
+# pattern (six layers, not the usual one -- a lone global layer measures up to
+# 27% off the full model) and ATTENTION_LAYER_TYPE picks which kind's timings a
+# run records; the rows carry it, so the second run merges into the same
+# attention.csv rather than overwriting the first.
 #
 #     MODEL="google/gemma-3-27b-it"
 #     HARDWARE="<the GPU actually in the machine>"

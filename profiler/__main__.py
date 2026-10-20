@@ -114,9 +114,10 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--attention-layer-type", choices=["full", "local"],
                    default="full", dest="attention_layer_type",
                    help="Which attention to measure on a hybrid model whose "
-                        "layers mix the two (Gemma-3). The profiled layer is "
-                        "forced to this kind and the rows are tagged with it, "
-                        "so profiling once per kind fills one CSV with both. "
+                        "layers mix the two (Gemma-3). The model is built as "
+                        "one repeat of its layer pattern, this kind's layers "
+                        "are recorded and the rows are tagged with it, so "
+                        "profiling once per kind fills one CSV with both. "
                         "No effect on a model without layer_types. "
                         "Default: full.")
     p.add_argument("--attention-max-kv", type=int, default=16384,

@@ -379,16 +379,18 @@ class ProfileArgs:
 
     # Attention grid
     attention_layer_type: str = "full"
-    """Which attention the profiled layer should be: "full" or "local".
+    """Which attention this run records: "full" or "local".
 
-    A hybrid model (Gemma-3) mixes both, but the profiler reduces the model
-    to ``num_hidden_layers=1``, so one run sees exactly one of them -- and
-    which one is decided by ``layer_types[0]``, not by anything in the
-    catalog. Both kinds instantiate the same ``Attention`` class, so the
-    difference is the kernel's shape, not its name: a local layer never
-    reads past ``sliding_window`` tokens of KV. Profile once per kind; the
-    writer keys on the type, so the second run merges into the same CSV
-    rather than overwriting the first.
+    A hybrid model (Gemma-3) mixes both. The profiler builds it as one
+    repeat of its layer pattern -- five local layers, then a global one
+    (``engine.hybrid_block``) -- because a lone layer measures global
+    attention up to 27% off the full model. Both kinds instantiate the same
+    ``Attention`` class, so the difference is the kernel's shape, not its
+    name: a local layer never reads past ``sliding_window`` tokens of KV.
+    The block returns one attention timing per layer, in order, and this
+    picks which positions are kept (``engine.attention_layer_indices``).
+    Profile once per kind; the writer keys on the type, so the second run
+    merges into the same CSV rather than overwriting the first.
 
     Ignored by a model that has no ``layer_types``, which is every
     non-hybrid one -- there is only full attention to measure."""

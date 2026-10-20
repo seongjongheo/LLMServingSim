@@ -105,6 +105,34 @@ def _profile_engine_overrides(args: ProfileArgs) -> dict[str, Any]:
     return out
 
 
+def hybrid_block(model_config: dict[str, Any] | None) -> list[str] | None:
+    """The layer types of one repeat of a hybrid model's pattern, or None.
+
+    The prefix of ``layer_types`` up to and including the first global
+    layer -- Gemma-3's ``[sliding x5, full]``. None for a model with no
+    ``layer_types``, or with only one kind of layer: there is nothing to
+    mix, and it keeps the one-layer profile.
+    """
+    types = (model_config or {}).get("layer_types")
+    if not types or "full_attention" not in types or len(set(types)) < 2:
+        return None
+    return list(types[:types.index("full_attention") + 1])
+
+
+def attention_layer_indices(args: ProfileArgs) -> list[int] | None:
+    """Which of the profiled block's attention layers this run records.
+
+    Indices into the block's attention timings, which vLLM's profile tree
+    returns in layer order. None keeps every one (a non-hybrid model's
+    single layer).
+    """
+    block = hybrid_block(args.model_config)
+    if block is None:
+        return None
+    want = "sliding_attention" if args.attention_layer_type == "local" else "full_attention"
+    return [i for i, t in enumerate(block) if t == want]
+
+
 def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     """Produce the final ``**kwargs`` to pass to ``vllm.LLM()``.
 
@@ -158,29 +186,33 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     if args.hf_overrides:
         hf_overrides = _deep_merge(hf_overrides, args.hf_overrides)
 
-    # 3b. Hybrid attention: force the single profiled layer to the kind this
-    # run is measuring. vLLM decides per layer from ``layer_types[layer_idx]``
-    # (v0.19.0 gemma3.py), and with num_hidden_layers=1 only index 0 is ever
-    # read -- which for Gemma-3 is a *local* layer, so a stock run would never
-    # measure the global kernel. Left alone for a model that declares no
-    # layer_types: it has only full attention to measure.
+    # 3b. Hybrid attention: build one real repeat of the layer pattern
+    # (Gemma-3: five local layers, then a global one) instead of a single
+    # layer, and keep the model's own layer_types and sliding_window.
+    # ``attention_layer_indices`` then picks this run's kind out of the
+    # block's attention timings.
     #
-    # The global run must also drop ``sliding_window`` itself. Setting
-    # layer_types alone leaves the field in the config, and something upstream
-    # of the attention module -- the KV cache spec, by the look of it -- still
-    # reads it and caps the context at the window: a T4 sweep measured decode
-    # attention flat from kv 1024 to 16384 with layer_types forced to
-    # full_attention, while the same model with the field deleted scaled 2.0x
-    # per doubling across 1024 -> 4096, as a KV-bandwidth read should. A
-    # Gemma-3 global layer genuinely has no window, so deleting the field is
-    # what measures it, not a distortion of it.
-    if args.model_config and args.model_config.get("layer_types"):
-        if args.attention_layer_type == "local":
-            hf_overrides["layer_types"] = ["sliding_attention"]
-        else:
-            hf_overrides["layer_types"] = ["full_attention"]
-            hf_overrides["sliding_window"] = None
-            hf_overrides["sliding_window_pattern"] = None
+    # A single layer measured the wrong thing for global attention. Run
+    # alone, repeated forward after forward, the global kernel came out
+    # 1-27% off the same kernel inside the 34-layer model on an RTX 4090
+    # (gemma-3-4b, bench/layercheck/global_attn.py): faster where one
+    # layer's KV fits in L2 and nothing evicts it, slower at large batch.
+    # Each condition was changed alone -- max_model_len, the window on the
+    # other layers -- and only the layer count moved it. One 5:1 block
+    # landed within 1.4% at 7 of 8 points; a single layer with L2 flushed
+    # before every forward was 14-29% slow, so it is the neighbouring
+    # layers, not a cold cache, that the measurement needs. Local attention
+    # was within ~1% either way.
+    #
+    # Inside the block the global layer reads its whole context with
+    # sliding_window still in the config (measured: 88 -> 302 us from kv
+    # 2048 to 8192 at n=8). Only a model whose layers are all global caps at
+    # the window when the field is present, which is why the one-layer
+    # global run used to delete it.
+    block = hybrid_block(args.model_config)
+    if block is not None:
+        hf_overrides["num_hidden_layers"] = len(block)
+        hf_overrides["layer_types"] = block
 
     # 4. TP sharding uses the model config directly. The written
     # config.json will have SHARD_FIELDS divided by tp via hf_overrides,

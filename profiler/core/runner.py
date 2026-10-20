@@ -22,8 +22,13 @@ from profiler.core.categories import (
     categories_for,
 )
 from profiler.core.config import Architecture, ProfileArgs, load_architecture
-from profiler.core.engine import probe_limits, spin_down, spin_up
-from profiler.core.hooks.timings import TimingSample
+from profiler.core.engine import (
+    attention_layer_indices,
+    probe_limits,
+    spin_down,
+    spin_up,
+)
+from profiler.core.hooks.timings import TimingSample, select_attention
 from profiler.core.writer import (
     persist_meta,
     replicate_tp_stable,
@@ -75,6 +80,7 @@ def _fire_one_category(
     """
     sink = sink_for(category, out_dir)
     catalog_slice = category.catalog_slice(arch)
+    keep = attention_layer_indices(args)
 
     prior_keys: set[tuple] = set()
     if not args.force:
@@ -128,13 +134,13 @@ def _fire_one_category(
             # TP rank). The timings are identical across ranks; take
             # rank 0's.
             timings_dicts = raw[0]
-            timings = [
+            timings = select_attention([
                 TimingSample(
                     layer=d["layer"],
                     microseconds=float(d["microseconds"]),
                 )
                 for d in timings_dicts
-            ]
+            ], keep)
             for point in category.extract_points(shot, timings, arch, tp):
                 sink.coalesce(point)
             bar.advance(1)

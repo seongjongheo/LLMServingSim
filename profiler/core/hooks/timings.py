@@ -140,3 +140,29 @@ def extract_samples(
 
     walk(tree, ancestors=[])
     return samples
+
+
+def select_attention(
+    samples: list[TimingSample],
+    keep: list[int] | None,
+) -> list[TimingSample]:
+    """Drop the attention samples of layers this run is not measuring.
+
+    A hybrid model is profiled as one block of its layer pattern, so a
+    shot returns one ``attention`` sample per layer, in layer order.
+    ``keep`` lists the positions to retain; the writer averages what is
+    left on its row key. Every other layer's samples pass through.
+    None keeps everything.
+    """
+    if keep is None:
+        return samples
+    out: list[TimingSample] = []
+    seen = 0
+    for s in samples:
+        if s.layer == "attention":
+            if seen in keep:
+                out.append(s)
+            seen += 1
+        else:
+            out.append(s)
+    return out
