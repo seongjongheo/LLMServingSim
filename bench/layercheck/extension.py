@@ -19,12 +19,17 @@ class Extension:
     """Worker-side entry point; ``self.model_runner`` is injected by vLLM."""
 
     def run_shot(self, shot_dict: dict[str, Any], tag: str,
-                 iterations: int = 3) -> dict[str, Any]:
+                 iterations: int = 3, flush_l2_mb: int = 0) -> dict[str, Any]:
         """Run one shot ``iterations`` times and return its kernels.
 
         Returns ``{"forward_ms": [...], "kernels": [...]}``. Each kernel is
         ``{"name", "start_us", "dur_us"}`` in launch order, across all timed
         forwards; the host splits them per forward by counting.
+
+        ``flush_l2_mb > 0`` overwrites a buffer that large before every timed
+        forward, so nothing the previous forward read is still in L2. The
+        fill kernel lands in each forward's kernel list ahead of the first
+        attention, i.e. in the first piece, never in an attention.
         """
         import torch
         from torch.autograd import DeviceType
@@ -44,9 +49,14 @@ class Extension:
         _forward()
         torch.cuda.synchronize()
 
+        flush = (torch.empty(flush_l2_mb << 20, dtype=torch.uint8, device="cuda")
+                 if flush_l2_mb > 0 else None)
+
         forward_ms: list[float] = []
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             for _ in range(iterations):
+                if flush is not None:
+                    flush.fill_(1)
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 torch.cuda.nvtx.range_push(tag)

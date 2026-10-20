@@ -19,6 +19,12 @@ and ``--report`` lines the global attention up against the profile CSV:
     allglobal16k  34 layers, every one global         (does the layer count?)
     hybrid16k     the real 5:1 model                  (does the window on the others?)
     hybrid        the real model, default max_model_len (= the bench run's shape)
+
+The first run showed the layer count is what moves it. Two candidate fixes
+for the profiler, each measured against hybrid16k:
+
+    pattern6      6 layers, one real 5:1 repeat     (profile a block, not a layer)
+    profile_flush one layer, L2 flushed every forward (profile a layer, cold cache)
 """
 
 from __future__ import annotations
@@ -46,7 +52,13 @@ CONFIGS = {
     "allglobal16k": dict(layers=None, all_global=True, max_model_len=16384),
     "hybrid16k": dict(layers=None, all_global=False, max_model_len=16384),
     "hybrid": dict(layers=None, all_global=False, max_model_len=None),
+    "pattern6": dict(layers=6, all_global=False, max_model_len=16384),
+    "profile_flush": dict(layers=1, all_global=True, max_model_len=16384, flush=True),
 }
+
+# Bigger than any GPU's L2 we run on (RTX 4090: 72 MB).
+FLUSH_MB = 256
+TARGET = "hybrid16k"
 
 OUT_DIR = Path("bench/results/layercheck/global_attn")
 PROFILE_CSV = Path("profiler/perf/RTX4090/google/gemma-3-4b-it/bf16/tp1/attention.csv")
@@ -90,7 +102,9 @@ def run(name, model_config_path, iterations):
         llm = LLM(**kwargs)
         for n, kv in GRID:
             shot = Shot.attention(0, 0, n, kv)
-            raw = llm.collective_rpc("run_shot", args=(shot.as_dict(), f"n{n}_kv{kv}", iterations))
+            raw = llm.collective_rpc(
+                "run_shot", args=(shot.as_dict(), f"n{n}_kv{kv}", iterations,
+                                  FLUSH_MB if cfg.get("flush") else 0))
             results[f"{n},{kv}"] = _global_attention(raw[0], types)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -129,22 +143,29 @@ def report():
     for name in CONFIGS:
         path = OUT_DIR / f"{name}.json"
         if path.exists():
-            runs[name] = json.loads(path.read_text())["results"]
+            runs[name] = {k: v["global_us"] for k, v in
+                          json.loads(path.read_text())["results"].items()}
+    if TARGET not in runs:
+        raise SystemExit(f"run --config {TARGET} first: it is what the rest is measured against")
 
-    print("global attention, us per layer (eager); [c] = of which split-kv combine")
-    print(f"{'n,kv':<10}{'csv':>8}" + "".join(f"{n:>20}" for n in runs))
+    cols = ["csv"] + [n for n in runs if n != TARGET]
+    print(f"global attention, us per layer (eager); % = off from {TARGET}, the real model")
+    print(f"{'n,kv':<9}{TARGET:>11}" + "".join(f"{c:>21}" for c in cols))
+    worst = dict.fromkeys(cols, 0.0)
     for n, kv in GRID:
-        ref = prof.get((n, kv))
-        cells = [f"{n},{kv}".ljust(10), f"{ref:>8.1f}" if ref else f"{'-':>8}"]
-        for name, res in runs.items():
-            r = res.get(f"{n},{kv}")
-            if r is None:
-                cells.append(f"{'-':>20}")
+        key = f"{n},{kv}"
+        target = runs[TARGET][key]
+        cells = [f"{key:<9}{target:>11.1f}"]
+        for c in cols:
+            val = prof.get((n, kv)) if c == "csv" else runs[c].get(key)
+            if val is None:
+                cells.append(f"{'-':>21}")
                 continue
-            err = f"{(ref - r['global_us']) / r['global_us'] * 100:+.0f}%" if ref else ""
-            cells.append(f"{r['global_us']:>8.1f} [{r['combine_us']:>4.1f}] {err:>5}")
+            err = (val - target) / target * 100
+            worst[c] = max(worst[c], abs(err))
+            cells.append(f"{val:>13.1f} {err:>+6.1f}%")
         print("".join(cells))
-    print("\nerr = how far the profile CSV is from that config")
+    print(f"{'worst':<20}" + "".join(f"{worst[c]:>20.1f}%" for c in cols))
 
 
 def main() -> int:
