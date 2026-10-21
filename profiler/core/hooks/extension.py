@@ -155,14 +155,17 @@ class Extension:
             ((e.time_range.start, e.name, e.time_range.elapsed_us())
              for e in prof.events() if e.device_type == DeviceType.CUDA),
         )
-        per = len(kernels) // iterations
-        if per * iterations != len(kernels):
-            raise ValueError(f"{len(kernels)} kernels do not split into "
-                             f"{iterations} forwards")
-        runs = [attention_per_layer([(n, d) for _, n, d in kernels[i * per:(i + 1) * per]])
-                for i in range(iterations)]
-        if len({len(r) for r in runs}) != 1:
-            raise ValueError(f"forwards disagree on attention count: "
-                             f"{[len(r) for r in runs]}")
+        # Cut the whole stream at its attentions, then fold it per forward.
+        # Splitting the kernel list into N equal parts instead misaligns as
+        # soon as two forwards launch a different number of other kernels:
+        # a part then starts mid-forward, still holds one attention per
+        # layer, and the last "layer" is some other layer's attention -- how
+        # the first block profile recorded 253 us (a local layer) for a
+        # global attention that takes 3414 us.
+        flat = attention_per_layer([(n, d) for _, n, d in kernels])
+        if len(flat) % iterations:
+            raise ValueError(f"{len(flat)} attentions over {iterations} forwards")
+        layers = len(flat) // iterations
+        runs = [flat[i * layers:(i + 1) * layers] for i in range(iterations)]
         return [{"layer": "attention", "microseconds": sum(col) / iterations}
                 for col in zip(*runs)]
