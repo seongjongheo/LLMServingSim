@@ -62,6 +62,31 @@ def _variant_root(out_root: Path, args: ProfileArgs) -> Path:
 # Shot firing + point ingestion (shared between run_full and run_slice)
 # ---------------------------------------------------------------------------
 
+# Rows are written to disk this often, so a run that dies keeps them.
+_CHECKPOINT_EVERY = 100
+# This many failed shots in a row means the engine, not the shot, is broken.
+_MAX_CONSECUTIVE_FAILURES = 5
+
+
+def _fire_with_retry(llm, shot, catalog_slice, kind, args):
+    """``fire`` one shot; on failure, once more before giving up."""
+    for attempt in (1, 2):
+        try:
+            raw = llm.collective_rpc(
+                "fire",
+                args=(shot.as_dict(), catalog_slice, kind,
+                      args.measurement_iterations),
+            )
+            # collective_rpc returns one result per worker (one per TP
+            # rank). The timings are identical across ranks; take rank 0's.
+            return raw[0]
+        except Exception as e:
+            if attempt == 2:
+                raise
+            log.warning("shot %s failed (%s); retrying once",
+                        shot.requests[:3], e)
+
+
 def _fire_one_category(
     llm,
     category: Category,
@@ -123,29 +148,49 @@ def _fire_one_category(
         return
 
     label = f"TP={tp}  {category.label}"
-    with log.progress(label, total=len(shots)) as bar:
-        for shot in shots:
-            raw = llm.collective_rpc(
-                "fire",
-                args=(shot.as_dict(), catalog_slice, category.name,
-                      args.measurement_iterations),
-            )
-            # collective_rpc returns one result per worker (one per
-            # TP rank). The timings are identical across ranks; take
-            # rank 0's.
-            timings_dicts = raw[0]
-            timings = select_attention([
-                TimingSample(
-                    layer=d["layer"],
-                    microseconds=float(d["microseconds"]),
-                )
-                for d in timings_dicts
-            ], keep)
-            for point in category.extract_points(shot, timings, arch, tp):
-                sink.coalesce(point)
-            bar.advance(1)
+    failed: list[tuple] = []
+    consecutive = 0
+    try:
+        with log.progress(label, total=len(shots)) as bar:
+            for i, shot in enumerate(shots, 1):
+                try:
+                    timings_dicts = _fire_with_retry(llm, shot, catalog_slice,
+                                                     category.name, args)
+                    consecutive = 0
+                except Exception as e:
+                    # One bad shot must not cost the hours before it. Skip
+                    # it -- it stays unmeasured, so a resume retries it --
+                    # unless the engine itself looks gone.
+                    failed.append(category.shot_key(shot))
+                    consecutive += 1
+                    log.warning("%s: shot %s failed twice, skipped: %s",
+                                category.label, shot.requests[:3], e)
+                    if consecutive >= _MAX_CONSECUTIVE_FAILURES:
+                        raise RuntimeError(
+                            f"{consecutive} shots in a row failed; stopping "
+                            f"with {i - len(failed)} measured and saved"
+                        ) from e
+                    bar.advance(1)
+                    continue
+                timings = select_attention([
+                    TimingSample(
+                        layer=d["layer"],
+                        microseconds=float(d["microseconds"]),
+                    )
+                    for d in timings_dicts
+                ], keep)
+                for point in category.extract_points(shot, timings, arch, tp):
+                    sink.coalesce(point)
+                if i % _CHECKPOINT_EVERY == 0:
+                    sink.flush(clear=False)
+                bar.advance(1)
+    finally:
+        # Written whether the loop finished or not: resume skips these.
+        sink.flush()
 
-    sink.flush()
+    if failed:
+        log.warning("%s: %d shots skipped after failing twice; re-run to retry "
+                    "them: %s", category.label, len(failed), failed[:10])
     log.success("%s → %s", category.label, sink.path)
 
 
