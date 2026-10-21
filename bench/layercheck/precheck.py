@@ -33,12 +33,15 @@ def main() -> int:
     llm, _, tmpdir = spin_up(args, 1)
     ok = True
     try:
-        for n, kv in ((8, 512), (8, 4096), (1, 8192)):
+        # Decode-only shots, then the two mixed ones the first block profile
+        # recorded wrong (global ~3414 us and ~119 us when right).
+        for pc, kp, n, kv in ((0, 0, 8, 512), (0, 0, 8, 4096), (0, 0, 1, 8192),
+                              (256, 4096, 32, 16384), (1024, 0, 16, 256)):
             raw = llm.collective_rpc(
-                "fire", args=(Shot.attention(0, 0, n, kv).as_dict(), slice_,
+                "fire", args=(Shot.attention(pc, kp, n, kv).as_dict(), slice_,
                               "attention", 3, True))
             times = [d["microseconds"] for d in raw[0] if d["layer"] == "attention"]
-            print(f"n={n:<2} kv={kv:<5}  per layer us: "
+            print(f"pc={pc:<4} kp={kp:<5} n={n:<2} kv={kv:<5}  per layer us: "
                   + "  ".join(f"{t:.1f}" for t in times))
             ok &= len(times) == 6
     finally:
