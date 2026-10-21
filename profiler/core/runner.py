@@ -24,6 +24,7 @@ from profiler.core.categories import (
 from profiler.core.config import Architecture, ProfileArgs, load_architecture
 from profiler.core.engine import (
     attention_layer_indices,
+    hybrid_block,
     probe_limits,
     spin_down,
     spin_up,
@@ -69,16 +70,27 @@ _MAX_CONSECUTIVE_FAILURES = 5
 
 
 def _fire_with_retry(llm, shot, catalog_slice, kind, args, per_layer):
-    """``fire`` one shot; on failure, once more before giving up."""
+    """``fire`` one shot; on failure, once more before giving up.
+
+    ``per_layer`` is the hybrid block's layer count (0 for a model profiled
+    as one layer); the per-layer timings must come back exactly that many.
+    """
     for attempt in (1, 2):
         try:
             raw = llm.collective_rpc(
                 "fire",
                 args=(shot.as_dict(), catalog_slice, kind,
-                      args.measurement_iterations, per_layer),
+                      args.measurement_iterations, bool(per_layer)),
             )
             # collective_rpc returns one result per worker (one per TP
             # rank). The timings are identical across ranks; take rank 0's.
+            if per_layer:
+                n_attn = sum(d["layer"] == "attention" for d in raw[0])
+                if n_attn != per_layer:
+                    # Picking layer i out of a list of the wrong length
+                    # records some other kernel as that layer's attention.
+                    raise ValueError(f"{n_attn} attention timings for a "
+                                     f"{per_layer}-layer block")
             return raw[0]
         except Exception as e:
             if attempt == 2:
@@ -108,7 +120,7 @@ def _fire_one_category(
     # A hybrid block's attentions are picked out by layer; that needs one
     # timing per layer, which only the worker's kernel path returns.
     keep = attention_layer_indices(args) if category.name == "attention" else None
-    per_layer = keep is not None
+    per_layer = len(hybrid_block(args.model_config)) if keep is not None else 0
 
     prior_keys: set[tuple] = set()
     if not args.force:
