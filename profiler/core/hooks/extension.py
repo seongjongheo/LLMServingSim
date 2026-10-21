@@ -32,7 +32,7 @@ from profiler.core.hooks.moe_hook import (
     force_moe_routing,
     single_moe_layer,
 )
-from profiler.core.hooks.timings import extract_samples
+from profiler.core.hooks.timings import attention_per_layer, extract_samples
 
 
 class Extension:
@@ -49,6 +49,7 @@ class Extension:
         slice_: dict[str, dict[str, Any]],
         kind: str,
         iterations: int = 3,
+        per_layer_attention: bool = False,
     ) -> list[dict[str, Any]]:
         """Run one profiling shot and return per-layer timings.
 
@@ -62,6 +63,11 @@ class Extension:
                 ``"moe"``. Used to decide whether to forge MoE routing.
             iterations: Number of timed forward passes (averaged via
                 the hook's invocation count). Default 3.
+            per_layer_attention: Return one ``attention`` sample per
+                layer, in layer order, timed from the raw kernels. A
+                hybrid model's block needs this: ``summary_stats``
+                merges its layers' identically named ``Attention``
+                modules into one. Only for ``kind == "attention"``.
 
         Returns:
             List of ``TimingSample`` as plain dicts (pickled back to host).
@@ -101,6 +107,11 @@ class Extension:
                 activated_experts=int(shot.experts["activated"]),
             )
 
+        if per_layer_attention:
+            if kind != "attention":
+                raise ValueError("per_layer_attention is for attention shots only")
+            return self._attention_per_layer(_fresh_batch, iterations)
+
         # -- measured runs (N iterations, averaged) -------------------
         # Local import so that profiler/__init__.py doesn't require
         # vllm.profiler to be importable at package-import time.
@@ -125,3 +136,33 @@ class Extension:
 
         samples = extract_samples(summary, slice_)
         return [s.as_dict() for s in samples]
+
+    def _attention_per_layer(self, fresh_batch, iterations: int) -> list[dict[str, Any]]:
+        """Time every layer's attention from the kernels of N forwards."""
+        import torch
+        from torch.autograd import DeviceType
+        from torch.profiler import ProfilerActivity, profile
+
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(iterations):
+                out = self.model_runner.execute_model(fresh_batch())
+                if out is None:
+                    self.model_runner.sample_tokens(None)
+            torch.cuda.synchronize()
+
+        kernels = sorted(
+            ((e.time_range.start, e.name, e.time_range.elapsed_us())
+             for e in prof.events() if e.device_type == DeviceType.CUDA),
+        )
+        per = len(kernels) // iterations
+        if per * iterations != len(kernels):
+            raise ValueError(f"{len(kernels)} kernels do not split into "
+                             f"{iterations} forwards")
+        runs = [attention_per_layer([(n, d) for _, n, d in kernels[i * per:(i + 1) * per]])
+                for i in range(iterations)]
+        if len({len(r) for r in runs}) != 1:
+            raise ValueError(f"forwards disagree on attention count: "
+                             f"{[len(r) for r in runs]}")
+        return [{"layer": "attention", "microseconds": sum(col) / iterations}
+                for col in zip(*runs)]

@@ -68,14 +68,14 @@ _CHECKPOINT_EVERY = 100
 _MAX_CONSECUTIVE_FAILURES = 5
 
 
-def _fire_with_retry(llm, shot, catalog_slice, kind, args):
+def _fire_with_retry(llm, shot, catalog_slice, kind, args, per_layer):
     """``fire`` one shot; on failure, once more before giving up."""
     for attempt in (1, 2):
         try:
             raw = llm.collective_rpc(
                 "fire",
                 args=(shot.as_dict(), catalog_slice, kind,
-                      args.measurement_iterations),
+                      args.measurement_iterations, per_layer),
             )
             # collective_rpc returns one result per worker (one per TP
             # rank). The timings are identical across ranks; take rank 0's.
@@ -105,7 +105,10 @@ def _fire_one_category(
     """
     sink = sink_for(category, out_dir)
     catalog_slice = category.catalog_slice(arch)
-    keep = attention_layer_indices(args)
+    # A hybrid block's attentions are picked out by layer; that needs one
+    # timing per layer, which only the worker's kernel path returns.
+    keep = attention_layer_indices(args) if category.name == "attention" else None
+    per_layer = keep is not None
 
     prior_keys: set[tuple] = set()
     if not args.force:
@@ -155,7 +158,8 @@ def _fire_one_category(
             for i, shot in enumerate(shots, 1):
                 try:
                     timings_dicts = _fire_with_retry(llm, shot, catalog_slice,
-                                                     category.name, args)
+                                                     category.name, args,
+                                                     per_layer)
                     consecutive = 0
                 except Exception as e:
                     # One bad shot must not cost the hours before it. Skip
@@ -179,7 +183,16 @@ def _fire_one_category(
                     )
                     for d in timings_dicts
                 ], keep)
-                for point in category.extract_points(shot, timings, arch, tp):
+                points = list(category.extract_points(shot, timings, arch, tp))
+                if not points:
+                    # A shot that measures nothing will measure nothing for
+                    # hours; stop on the first one instead.
+                    raise RuntimeError(
+                        f"{category.label}: shot {shot.requests[:3]} returned "
+                        f"no rows ({len(timings_dicts)} samples from the "
+                        f"worker, {len(timings)} after layer selection)"
+                    )
+                for point in points:
                     sink.coalesce(point)
                 if i % _CHECKPOINT_EVERY == 0:
                     sink.flush(clear=False)

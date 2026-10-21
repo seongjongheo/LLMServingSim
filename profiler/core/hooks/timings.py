@@ -23,6 +23,7 @@ The DFS path carries the list of ancestor class names, so the
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -148,8 +149,9 @@ def select_attention(
 ) -> list[TimingSample]:
     """Drop the attention samples of layers this run is not measuring.
 
-    A hybrid model is profiled as one block of its layer pattern, so a
-    shot returns one ``attention`` sample per layer, in layer order.
+    A hybrid model is profiled as one block of its layer pattern, and its
+    shots are fired with ``per_layer_attention`` so they return one
+    ``attention`` sample per layer, in layer order (``attention_per_layer``).
     ``keep`` lists the positions to retain; the writer averages what is
     left on its row key. Every other layer's samples pass through.
     None keeps everything.
@@ -166,3 +168,46 @@ def select_attention(
         else:
             out.append(s)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-layer attention from raw kernels (hybrid models)
+# ---------------------------------------------------------------------------
+#
+# vLLM's ``summary_stats`` merges modules that share a name, so the six
+# ``Attention`` modules of a hybrid block come back as one node: the mean of
+# five local layers and one global one. The kernels themselves keep their
+# order, and every attention brackets the same way -- the KV write, the
+# attention kernel, and (split-kv only) its combine pass -- so cutting the
+# kernel stream there gives each layer's attention on its own.
+
+_ATTN_MAIN_RE = re.compile(r"flash_fwd(?!_splitkv_combine)")
+_ATTN_AFTER_RE = re.compile(r"flash_fwd_splitkv_combine")
+_ATTN_BEFORE_RE = re.compile(r"reshape_and_cache")
+
+
+def attention_per_layer(names_durs: list[tuple[str, float]]) -> list[float]:
+    """Each layer's attention time, in order, from one forward's kernels.
+
+    ``names_durs`` is ``(kernel_name, duration_us)`` in launch order. A
+    layer's attention is its attention kernel, the KV-write kernel before it
+    and any split-kv combine after it. Raises if no attention kernel is
+    recognised -- a backend this does not know yet -- rather than return
+    nothing and let the caller write an empty table.
+    """
+    attn: list[float] = []
+    pending = 0.0  # a KV write waiting for the attention it belongs to
+    for name, dur in names_durs:
+        if _ATTN_MAIN_RE.search(name):
+            attn.append(pending + dur)
+            pending = 0.0
+        elif _ATTN_AFTER_RE.search(name) and attn:
+            attn[-1] += dur
+        elif _ATTN_BEFORE_RE.search(name):
+            pending += dur
+    if not attn:
+        raise ValueError(
+            "no attention kernel recognised in the forward's kernels; "
+            "attention_per_layer knows FlashAttention's flash_fwd* names only"
+        )
+    return attn

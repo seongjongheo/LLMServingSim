@@ -321,7 +321,7 @@ def _build_cases(args: ProfileArgs, limits) -> list[SkewCase]:
 def _measure(llm, reqs, slice_, iters: int, keep) -> float:
     shot = Shot(requests=[tuple(r) for r in reqs])
     raw = llm.collective_rpc(
-        "fire", args=(shot.as_dict(), slice_, "attention", iters))
+        "fire", args=(shot.as_dict(), slice_, "attention", iters, keep is not None))
     timings = select_attention(
         [TimingSample(layer=d["layer"], microseconds=float(d["microseconds"]))
          for d in raw[0]], keep)
